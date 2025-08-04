@@ -1,215 +1,277 @@
+# app.py - FINALE VERSIE MET CANCEL-KNOP EN VERGRENDELDE UI
+
 import streamlit as st
 import pandas as pd
-from io import BytesIO
+import praw
+from praw.exceptions import PRAWException
+from prawcore.exceptions import NotFound, Forbidden, BadRequest
 
-from reddit_scanner import find_communities
-from signal_finder import (
-    initialize_reddit_client,
-    find_buying_signals,
-)
+# --- Configuratie & Secrets ---
+CLIENT_ID = st.secrets.get("reddit_client_id")
+CLIENT_SECRET = st.secrets.get("reddit_client_secret")
+APP_PASSWORD = st.secrets.get("app_password")
+REDIRECT_URI = st.secrets.get("redirect_uri")
 
-# --- Inlogscherm ---
-def show_login_form():
+# --- Helper Functies ---
+# Deze functies blijven ongewijzigd, ze worden aangeroepen vanuit de hoofd-app.
+@st.cache_data(ttl=3600, show_spinner=False)
+def find_communities_for_query(_reddit, query: str):
+    """Zoekt naar subreddits voor EEN ENKELE zoekterm."""
+    results = []
+    for subreddit in _reddit.subreddits.search(query, limit=10):
+        results.append({
+            'Community': f"r/{subreddit.display_name}",
+            'Members': subreddit.subscribers,
+            'Community Link': f"https://www.reddit.com/r/{subreddit.display_name}",
+            'Top Posts (Month)': f"https://www.reddit.com/r/{subreddit.display_name}/top/?t=month",
+            'Found By': query
+        })
+    return results
+
+def find_buying_signals(_reddit, subreddit_name: str, keywords: list, time_filter: str, post_limit: int, comment_limit: int):
+    """Scant EEN ENKELE subreddit en geeft een lijst met gevonden signalen terug."""
+    signals = []
+    subreddit = _reddit.subreddit(subreddit_name)
+    top_posts = subreddit.top(time_filter=time_filter, limit=post_limit)
+    for post in top_posts:
+        post_content = f"{post.title.lower()} {post.selftext.lower()}"
+        matched_post_keywords = {keyword for keyword in keywords if keyword.lower() in post_content}
+        if matched_post_keywords and post.author:
+            signals.append({
+                "Subreddit": subreddit_name, "Match": ', '.join(matched_post_keywords), "Type": "Post",
+                "Text": post.title.replace('\n', ' ').strip(),
+                "Author": post.author.name, "Link": f"https://reddit.com{post.permalink}"
+            })
+        if comment_limit > 0:
+            post.comments.replace_more(limit=0)
+            for comment in post.comments.list():
+                if hasattr(comment, 'body') and comment.author:
+                    for keyword in keywords:
+                        if keyword.lower() in comment.body.lower():
+                            signals.append({
+                                "Subreddit": subreddit_name, "Match": keyword, "Type": "Comment",
+                                "Text": comment.body.replace('\n', ' ').strip()[:300] + '...',
+                                "Author": comment.author.name, "Link": f"https://reddit.com{comment.permalink}"
+                            })
+                            break
+    return signals
+
+# --- UI Functies voor Authenticatie ---
+def show_password_form():
     st.title("🚀 The Audience Finder PRO")
-    st.header("Login")
-
-    with st.form(key='login_form'):
+    st.header("Step 1: App Access Login")
+    with st.form(key='password_login_form'):
         password = st.text_input("Please enter the password", type="password", label_visibility="collapsed")
-        submitted = st.form_submit_button("Login")
-
-        if submitted:
-            if password == st.secrets.get("app_password", "test"):
-                st.session_state["logged_in"] = True
+        if st.form_submit_button("Login", use_container_width=True):
+            if password == APP_PASSWORD:
+                st.session_state["password_correct"] = True
                 st.rerun()
             else:
                 st.error("🚨 The password you entered is incorrect.")
 
-# --- Hoofdapplicatie ---
-def show_main_app():
+def show_reddit_login_page():
     st.title("🚀 The Audience Finder PRO")
-    st.markdown("Discover relevant Reddit communities **and buying signals** based on your search queries.")
+    st.header("Step 2: Connect your Reddit Account")
+    st.markdown("Access confirmed. Please log in with Reddit to allow the app to perform searches on your behalf.")
+    reddit_auth_instance = praw.Reddit(
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
+        redirect_uri=REDIRECT_URI, user_agent="AudienceFinderPro/Boyd (OAuth Setup)"
+    )
+    auth_url = reddit_auth_instance.auth.url(scopes=["identity", "read", "history"], state="pro_login", duration="permanent")
+    st.link_button("Login with Reddit", auth_url, type="primary", use_container_width=True)
+    st.info("ℹ️ You will be redirected to Reddit to grant permission. This app never sees your password.")
 
-    st.header("1. Enter Your Search Queries")
-    st.markdown("Enter one search query per line. Combine words on a single line for more specific results.")
+# --- Hoofdapplicatie ---
+def show_main_app(reddit):
+    # Initialiseer de statusvariabelen voor de scans
+    if 'community_scan_running' not in st.session_state:
+        st.session_state.community_scan_running = False
+    if 'signal_scan_running' not in st.session_state:
+        st.session_state.signal_scan_running = False
+    if 'cancel_scan' not in st.session_state:
+        st.session_state.cancel_scan = False
 
-    with st.form(key='search_form'):
-        search_queries_input = st.text_area(
-            "Label for screen readers, not displayed",
-            label_visibility="collapsed",
-            height=150,
-            placeholder="For example:\nSaaS for startups\ndigital nomad\nproductivity tools"
-        )
-        find_button_submitted = st.form_submit_button("Find Communities", type="primary")
+    col1, col2 = st.columns([0.85, 0.15])
+    with col1:
+        st.title("🚀 The Audience Finder PRO")
+        st.markdown(f"Logged in as **u/{st.session_state.username}**. Discover communities **and buying signals**.")
+    with col2:
+        if st.button("Logout", use_container_width=True, disabled=(st.session_state.community_scan_running or st.session_state.signal_scan_running)):
+            st.session_state.clear()
+            st.rerun()
 
-    if find_button_submitted:
-        search_queries_list = [query.strip() for query in search_queries_input.split('\n') if query.strip()]
-        
-        if not search_queries_list:
+    # --- Deel 1: Communities Vinden ---
+    st.header("1. Find Relevant Communities")
+    
+    # Formulier voor het invoeren van zoektermen
+    is_any_scan_running = st.session_state.community_scan_running or st.session_state.signal_scan_running
+    with st.form(key='community_search_form'):
+        search_queries_input = st.text_area("Queries", label_visibility="collapsed", height=150, placeholder="For example:\nSaaS for startups...", disabled=is_any_scan_running)
+        community_form_submitted = st.form_submit_button("Find Communities", type="primary", use_container_width=True, disabled=is_any_scan_running)
+
+    # Logica voor het starten van de community scan
+    if community_form_submitted and not st.session_state.community_scan_running:
+        st.session_state.search_queries_list = [q.strip() for q in search_queries_input.split('\n') if q.strip()]
+        if not st.session_state.search_queries_list:
             st.warning("Please enter at least one search query.")
         else:
-            with st.spinner('🔍 Searching Reddit...'):
-                try:
-                    results_df = find_communities(search_queries_list)
+            st.session_state.community_scan_running = True
+            st.session_state.cancel_scan = False
+            st.rerun()
 
-                    if not results_df.empty:
-                        df_for_display = results_df.copy()
-                        df_for_download = results_df.copy()
-                        df_for_download['Status'] = 'Not Started'
-                        df_for_download['Priority'] = ''
-                        df_for_download['Notes'] = ''
-                        df_for_download['Last Contact'] = ''
-
-                        st.session_state["audience_display"] = df_for_display
-                        st.session_state["audience_download"] = df_for_download
-                    else:
-                        st.session_state["audience_display"] = None
-                        st.session_state["audience_download"] = None
-
-                except Exception as e:
-                    st.error(f"An error occurred: {e}")
-
-    st.header("2. Discovered Communities")
-
-    if st.session_state.get("audience_display") is not None:
-        st.dataframe(st.session_state["audience_display"], use_container_width=True)
-    else:
-        st.write("—")
-
-    st.header("3. Download Your Results")
-
-    if st.session_state.get("audience_download") is not None:
-        csv_data = st.session_state["audience_download"].to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download as CSV",
-            data=csv_data,
-            file_name='audience_finder_results.csv',
-            mime='text/csv'
-        )
-    else:
-        st.write("—")
-
-    # --- Koopsignalen Scan ---
-    st.header("4. Buying Signal Scanner (Pro Feature)")
-
-    time_filter = st.radio(
-        "Select time frame for top posts",
-        options=["day", "week", "month", "year", "all"],
-        index=2,
-        horizontal=True
-    )
-
-    # --- Preset keuze met tooltip ---
-    st.markdown("**Scan Intensity**")
-    preset = st.radio(
-        label="Choose scan depth",
-        options=["🟢 Fast (10 posts / 20 comments)", 
-                "🔵 Standard (50 / 100)", 
-                "🔴 Deep (100 / 500)", 
-                "⚙️ Custom"],
-        index=1,
-        horizontal=True,
-        help=(
-            "🟢 Fast: Quick test with minimal depth.\n"
-            "🔵 Standard: Balanced speed and coverage.\n"
-            "🔴 Deep: Slower, but finds more signals.\n"
-            "⚙️ Custom: Set your own limits below."
-        )
-    )
-    # --- Limieten instellen op basis van preset ---
-    if preset.startswith("🟢"):
-        post_limit = 10
-        comment_limit = 20
-    elif preset.startswith("🔵"):
-        post_limit = 50
-        comment_limit = 100
-    elif preset.startswith("🔴"):
-        post_limit = 100
-        comment_limit = 500
-    else:
-        col1, col2 = st.columns(2)
-        with col1:
-            post_limit = st.number_input(
-                "Number of top posts per subreddit",
-                min_value=1,
-                max_value=100,
-                value=50,
-                step=1
-            )
-        with col2:
-            comment_limit = st.number_input(
-                "Max comments per post",
-                min_value=0,
-                max_value=500,
-                value=100,
-                step=10
-            )
-
-
-    subreddits_input = st.text_area(
-        "Subreddits to scan (one per line)",
-        placeholder="e.g. sidehustle\nsolopreneur\nstartups",
-        height=200
-    )
-
-    keywords_input = st.text_area(
-        "Pain point keywords to search for (one per line)",
-        placeholder="e.g. find product-market fit\nmarket research\nwhere to post",
-        height=200
-    )
-
-    if st.button("🔎 Run Buying Signal Scan"):
-        custom_subreddits = [s.strip() for s in subreddits_input.split('\n') if s.strip()]
-        custom_keywords = [k.strip() for k in keywords_input.split('\n') if k.strip()]
-
-        if not custom_subreddits or not custom_keywords:
-            st.warning("❗ Please fill in both subreddits and keywords before scanning.")
-        else:
-            with st.spinner("🔍 Initializing Reddit client..."):
-                reddit = initialize_reddit_client()
-
-            if reddit:
-                total = len(custom_subreddits)
-                results = []
-                progress = st.progress(0.0, text="Starting scan...")
-
-                for i, subreddit in enumerate(custom_subreddits):
-                    progress.progress(i / total, text=f"Scanning r/{subreddit} ({i}/{total})...")  # 👈 begint bij 0/x
-                    try:
-                        signals = signals = find_buying_signals(reddit, [subreddit], custom_keywords, time_filter, post_limit, comment_limit)
-                        results.extend(signals)
-                        progress.progress((i + 1) / total, text=f"✅ Completed r/{subreddit} ({i+1}/{total})")
-                    except Exception as e:
-                        st.warning(f"❌ Error scanning r/{subreddit}: {e}")
-                        progress.progress((i + 1) / total, text=f"⚠️ Skipped r/{subreddit} ({i+1}/{total})")
-
-                progress.progress(1.0, text="🎉 All subreddits processed!")
-
-                if results:
-                    df_signals = pd.DataFrame(results)
-                    st.session_state["signals_display"] = df_signals
+    # De daadwerkelijke scan-loop (wordt alleen getoond als de scan loopt)
+    if st.session_state.community_scan_running:
+        st.info("Community search in progress...")
+        if st.button("Cancel Search"):
+            st.session_state.cancel_scan = True
+        
+        all_results = []
+        progress_bar = st.progress(0.0, text="Starting search...")
+        
+        try:
+            queries = st.session_state.search_queries_list
+            total = len(queries)
+            for i, query in enumerate(queries):
+                if st.session_state.cancel_scan:
+                    st.warning("Search cancelled by user.")
+                    break
+                progress_bar.progress((i + 1) / total, text=f"Searching for: '{query}'...")
+                results = find_communities_for_query(reddit, query)
+                all_results.extend(results)
+            
+            if not st.session_state.cancel_scan:
+                if all_results:
+                    # Aggregeer de resultaten na de loop
+                    df = pd.DataFrame(all_results)
+                    agg_df = df.groupby(['Community', 'Members', 'Community Link', 'Top Posts (Month)'])['Found By'].apply(lambda x: ', '.join(sorted(set(x)))).reset_index()
+                    agg_df = agg_df.rename(columns={'Found By': 'Found By (Keywords)'})
+                    st.session_state["audience_df"] = agg_df.sort_values(by='Members', ascending=False).reset_index(drop=True)
                 else:
-                    st.session_state["signals_display"] = None
+                    st.session_state["audience_df"] = None
+        finally:
+            # Essentieel: reset de status zodat de UI weer ontgrendeld wordt
+            st.session_state.community_scan_running = False
+            st.session_state.cancel_scan = False
+            st.rerun()
+
+    # Weergave van resultaten en downloadknop
+    st.header("2. Discovered Communities")
+    if "audience_df" in st.session_state and st.session_state.audience_df is not None:
+        st.dataframe(st.session_state["audience_df"], use_container_width=True, hide_index=True)
+    else:
+        st.write("—")
+
+    st.header("3. Download Community List")
+    if "audience_df" in st.session_state and st.session_state.audience_df is not None:
+        df_for_download = st.session_state['audience_df'].copy()
+        df_for_download['Status'] = 'Not Started'; df_for_download['Priority'] = ''; df_for_download['Notes'] = ''
+        csv_data = df_for_download.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Communities as CSV", csv_data, 'community_finder_results.csv', 'text/csv', use_container_width=True)
+    else:
+        st.write("—")
+
+    # --- Deel 2: Koopsignalen Scan ---
+    st.divider()
+    st.header("4. Buying Signal Scanner")
+
+    with st.form(key="signal_scanner_form", border=True):
+        preset = st.radio("Scan Intensity", ["🟢 Fast", "🔵 Standard", "🔴 Deep", "⚙️ Custom"], index=1, horizontal=True, disabled=is_any_scan_running)
+        if preset.startswith("⚙️"):
+            c1, c2 = st.columns(2); post_limit_custom = c1.number_input("Posts per subreddit", 1, 200, 50, 1, disabled=is_any_scan_running); comment_limit_custom = c2.number_input("Max comments per post", 0, 1000, 100, 10, disabled=is_any_scan_running)
+        time_filter = st.radio("Time frame for top posts", ["day", "week", "month", "year", "all"], index=2, horizontal=True, disabled=is_any_scan_running)
+        subreddits_input = st.text_area("Subreddits to scan (one per line)", placeholder="e.g. sidehustle\nsolopreneur", height=150, disabled=is_any_scan_running)
+        keywords_input = st.text_area("Pain point keywords (one per line)", placeholder="e.g. market research\nfind clients", height=150, disabled=is_any_scan_running)
+        signal_form_submitted = st.form_submit_button("🔎 Run Buying Signal Scan", type="primary", use_container_width=True, disabled=is_any_scan_running)
+
+    if signal_form_submitted and not st.session_state.signal_scan_running:
+        st.session_state.signal_scan_running = True; st.session_state.cancel_scan = False
+        if preset.startswith("🟢"): st.session_state.limits = (10, 20)
+        elif preset.startswith("🔵"): st.session_state.limits = (50, 100)
+        elif preset.startswith("🔴"): st.session_state.limits = (100, 500)
+        else: st.session_state.limits = (post_limit_custom, comment_limit_custom)
+        st.session_state.time_filter = time_filter
+        st.session_state.subreddits = [s.strip() for s in subreddits_input.split('\n') if s.strip()]
+        st.session_state.keywords = [k.strip() for k in keywords_input.split('\n') if k.strip()]
+        st.rerun()
+
+    if st.session_state.signal_scan_running:
+        st.info("Buying signal scan in progress...")
+        if st.button("Cancel Scan"):
+            st.session_state.cancel_scan = True
+        
+        all_signals = []
+        progress_bar = st.progress(0.0, text="Starting scan...")
+        
+        try:
+            post_limit, comment_limit = st.session_state.limits
+            custom_subreddits = st.session_state.subreddits
+            custom_keywords = st.session_state.keywords
+            time_filter = st.session_state.time_filter
+            total = len(custom_subreddits)
+
+            if not custom_subreddits or not custom_keywords:
+                st.warning("❗ Please provide both subreddits and keywords.")
             else:
-                st.error("❌ Failed to initialize Reddit client.")
+                for i, sub_name_raw in enumerate(custom_subreddits):
+                    if st.session_state.cancel_scan:
+                        st.warning("Scan cancelled by user."); break
+                    sub_name = sub_name_raw.replace('r/', '').strip()
+                    progress_bar.progress(i / total, text=f"Scanning r/{sub_name} ({i}/{total})...")
+                    try:
+                        signals = find_buying_signals(reddit, sub_name, custom_keywords, time_filter, post_limit, comment_limit)
+                        if signals: all_signals.extend(signals)
+                        progress_bar.progress((i + 1) / total, text=f"✅ Completed r/{sub_name} ({i+1}/{total})")
+                    except (NotFound, Forbidden, BadRequest) as e:
+                        st.warning(f"Skipped r/{sub_name}: {e.__class__.__name__} - check if the subreddit exists and is public."); progress_bar.progress((i + 1) / total, text=f"⚠️ Skipped r/{sub_name}")
+                    except PRAWException as e:
+                        st.warning(f"A Reddit API error occurred at r/{sub_name}: {e}"); progress_bar.progress((i + 1) / total, text=f"⚠️ Skipped r/{sub_name}")
+                if not st.session_state.cancel_scan:
+                    st.session_state["signals_df"] = pd.DataFrame(all_signals) if all_signals else None
+        finally:
+            st.session_state.signal_scan_running = False
+            st.session_state.cancel_scan = False
+            st.rerun()
 
-    # --- Signalen tonen indien beschikbaar ---
-    if st.session_state.get("signals_display") is not None:
-        st.success(f"✅ Found {len(st.session_state['signals_display'])} buying signals.")
-        st.dataframe(st.session_state["signals_display"], use_container_width=True)
+    if "signals_df" in st.session_state and st.session_state.signals_df is not None:
+        df_signals = st.session_state["signals_df"]
+        st.success(f"✅ Found {len(df_signals)} buying signals.")
+        st.dataframe(df_signals, use_container_width=True, hide_index=True)
+        df_signals_download = df_signals.copy(); df_signals_download['Text'] = df_signals_download['Text'].str.replace('\n', ' ', regex=False).str.strip()
+        csv_signals = df_signals_download.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Signals as CSV", csv_signals, 'buying_signals.csv', 'text/csv', use_container_width=True)
 
-        csv = st.session_state["signals_display"].to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Signals as CSV",
-            data=csv,
-            file_name='buying_signals.csv',
-            mime='text/csv'
-        )
+# --- Hoofdlogica (Login State Machine) ---
+def main():
+    st.set_page_config(page_title="The Audience Finder PRO", layout="wide")
+    auth_code = st.query_params.get("code")
+    if "refresh_token" in st.session_state:
+        try:
+            reddit_instance = praw.Reddit(
+                client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
+                user_agent=f"AudienceFinderPro/Boyd (user: {st.session_state.get('username', '...')})",
+                refresh_token=st.session_state["refresh_token"]
+            )
+            if not reddit_instance.user.me(): raise PRAWException("Token expired or revoked.")
+            show_main_app(reddit_instance)
+        except PRAWException as e:
+            st.error(f"Reddit connection failed: {e}. Please log in again."); st.session_state.clear(); st.rerun()
+        return
+    if auth_code:
+        try:
+            temp_reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, redirect_uri=REDIRECT_URI, user_agent="AudienceFinderPro/Boyd (Token Exchange)")
+            refresh_token = temp_reddit.auth.authorize(auth_code)
+            st.session_state["refresh_token"] = refresh_token
+            user_reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, user_agent="AudienceFinderPro/Boyd (Get Username)", refresh_token=refresh_token)
+            st.session_state["username"] = user_reddit.user.me().name
+            st.session_state["password_correct"] = True
+            st.query_params.clear(); st.rerun()
+        except PRAWException as e:
+            st.error(f"Reddit authentication failed: {e}. Please try again."); st.session_state.clear(); st.rerun()
+        return
+    if st.session_state.get("password_correct"):
+        show_reddit_login_page()
+        return
+    show_password_form()
 
-# --- App logica ---
-if "logged_in" not in st.session_state:
-    st.session_state["logged_in"] = False
-
-if st.session_state["logged_in"]:
-    show_main_app()
-else:
-    show_login_form()
+if __name__ == "__main__":
+    main()
