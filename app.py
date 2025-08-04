@@ -58,7 +58,7 @@ def find_buying_signals(_reddit, subreddit_name: str, keywords: list, time_filte
 
 # --- UI Functies voor Authenticatie ---
 def show_password_form():
-    st.title("🚀 The Audience Finder PRO")
+    st.title("🚀 The Opportunity Finder")
     st.header("Step 1: App Access Login")
     with st.form(key='password_login_form'):
         password = st.text_input("Please enter the password", type="password", label_visibility="collapsed")
@@ -70,12 +70,12 @@ def show_password_form():
                 st.error("🚨 The password you entered is incorrect.")
 
 def show_reddit_login_page():
-    st.title("🚀 The Audience Finder PRO")
+    st.title("🚀 The Opportunity Finder")
     st.header("Step 2: Connect your Reddit Account")
     st.markdown("Access confirmed. Please log in with Reddit to allow the app to perform searches on your behalf.")
     reddit_auth_instance = praw.Reddit(
         client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
-        redirect_uri=REDIRECT_URI, user_agent="AudienceFinderPro/Boyd (OAuth Setup)"
+        redirect_uri=REDIRECT_URI, user_agent="TheOpportunityFinder/Boyd (OAuth Setup)"
     )
     auth_url = reddit_auth_instance.auth.url(scopes=["identity", "read", "history"], state="pro_login", duration="permanent")
     st.link_button("Login with Reddit", auth_url, type="primary", use_container_width=True)
@@ -93,7 +93,7 @@ def show_main_app(reddit):
 
     col1, col2 = st.columns([0.85, 0.15])
     with col1:
-        st.title("🚀 The Audience Finder PRO")
+        st.title("🚀 The Opportunity Finder")
         st.markdown(f"Logged in as **u/{st.session_state.username}**. Discover communities **and buying signals**.")
     with col2:
         if st.button("Logout", use_container_width=True, disabled=(st.session_state.community_scan_running or st.session_state.signal_scan_running)):
@@ -172,7 +172,7 @@ def show_main_app(reddit):
 
     # --- Deel 2: Koopsignalen Scan ---
     st.divider()
-    st.header("4. Buying Signal Scanner")
+    st.header("4. Opportunity Finder")
 
     with st.form(key="signal_scanner_form", border=True):
         preset = st.radio("Scan Intensity", ["🟢 Fast", "🔵 Standard", "🔴 Deep", "⚙️ Custom"], index=1, horizontal=True, disabled=is_any_scan_running)
@@ -238,17 +238,17 @@ def show_main_app(reddit):
         st.dataframe(df_signals, use_container_width=True, hide_index=True)
         df_signals_download = df_signals.copy(); df_signals_download['Text'] = df_signals_download['Text'].str.replace('\n', ' ', regex=False).str.strip()
         csv_signals = df_signals_download.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Signals as CSV", csv_signals, 'buying_signals.csv', 'text/csv', use_container_width=True)
+        st.download_button("📥 Download Signals as CSV", csv_signals, 'opportunity_finder_signals.csv', 'text/csv', use_container_width=True)
 
 # --- Hoofdlogica (Login State Machine) ---
 def main():
-    st.set_page_config(page_title="The Audience Finder PRO", layout="wide")
+    st.set_page_config(page_title="The Opportunity Finder", layout="wide")
     auth_code = st.query_params.get("code")
     if "refresh_token" in st.session_state:
         try:
             reddit_instance = praw.Reddit(
                 client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
-                user_agent=f"AudienceFinderPro/Boyd (user: {st.session_state.get('username', '...')})",
+                user_agent=f"TheOpportunityFinder/Boyd (user: {st.session_state.get('username', '...')})",
                 refresh_token=st.session_state["refresh_token"]
             )
             if not reddit_instance.user.me(): raise PRAWException("Token expired or revoked.")
@@ -258,10 +258,10 @@ def main():
         return
     if auth_code:
         try:
-            temp_reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, redirect_uri=REDIRECT_URI, user_agent="AudienceFinderPro/Boyd (Token Exchange)")
+            temp_reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, redirect_uri=REDIRECT_URI, user_agent="TheOpportunityFinder/Boyd (Token Exchange)")
             refresh_token = temp_reddit.auth.authorize(auth_code)
             st.session_state["refresh_token"] = refresh_token
-            user_reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, user_agent="AudienceFinderPro/Boyd (Get Username)", refresh_token=refresh_token)
+            user_reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, user_agent="TheOpportunityFinder/Boyd (Get Username)", refresh_token=refresh_token)
             st.session_state["username"] = user_reddit.user.me().name
             st.session_state["password_correct"] = True
             st.query_params.clear(); st.rerun()
