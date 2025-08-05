@@ -1,4 +1,4 @@
-# app.py - Opportunity Finder v2.1 met Spinner en Geharmoniseerde UI
+# app.py - Opportunity Finder v2.4 met gesynchroniseerde Discovery-functionaliteit
 
 import streamlit as st
 import pandas as pd
@@ -13,8 +13,7 @@ CLIENT_SECRET = st.secrets.get("reddit_client_secret")
 APP_PASSWORD = st.secrets.get("app_password")
 REDIRECT_URI = st.secrets.get("redirect_uri")
 
-# --- Hybride Zoekfunctie (met de progress bar verwijderd) ---
-
+# --- Hulpfunctie (Identiek aan Audience Finder) ---
 def calculate_relevance_score(found_via_string):
     """Berekent een logische score op basis van de gevonden methodes."""
     score = 0
@@ -23,23 +22,42 @@ def calculate_relevance_score(found_via_string):
     if "Relevant Comment" in found_via_string: score += 3
     return score
 
-@st.cache_data(ttl=3600, show_spinner=False)
+# --- Hybride Zoekfunctie (Identiek aan Audience Finder) ---
 def find_communities_hybrid(_reddit_instance, search_queries: tuple, direct_limit: int, post_limit: int, comment_limit: int):
-    # VERWIJDERD: De st.progress_bar is hier weggehaald, de spinner regelt dit nu.
-    reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, user_agent=f"OpportunityFinder by Boyd v2.1 (spinner_fix)", refresh_token=st.session_state.get("refresh_token"))
+    """
+    Vindt communities met een HYBRIDE aanpak en ondersteunt een cancel-operatie.
+    """
+    reddit = praw.Reddit(
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
+        user_agent=f"OpportunityFinder by Boyd v2.4",
+        refresh_token=st.session_state.get("refresh_token")
+    )
     aggregated_results = {}
+    
+    progress_bar = st.session_state.get('progress_bar_placeholder')
 
-    for query in search_queries:
+    for i, query in enumerate(search_queries):
+        if st.session_state.get('cancel_scan'):
+            st.warning("Search cancelled by user.")
+            break
+        
+        if progress_bar:
+            progress_bar.progress(i / len(search_queries), text=f"Searching for: '{query}'...")
+            
         # Direct Search
         try:
             for sub in reddit.subreddits.search(query, limit=direct_limit):
+                if st.session_state.get('cancel_scan'): break
                 if sub.display_name.startswith('u_'): continue
                 if sub.display_name not in aggregated_results: aggregated_results[sub.display_name] = {'Community': sub.display_name, 'Members': sub.subscribers, 'Found Via': set()}
                 aggregated_results[sub.display_name]['Found Via'].add('Direct Search')
         except PRAWException: pass
+        if st.session_state.get('cancel_scan'): break
+        
         # Post & Comment Search
         try:
             for post in reddit.subreddit("all").search(query, sort="relevance", time_filter="month", limit=post_limit):
+                if st.session_state.get('cancel_scan'): break
                 if post.subreddit.display_name.startswith('u_') or post.subreddit.over18: continue
                 community_name = post.subreddit.display_name
                 if community_name not in aggregated_results: aggregated_results[community_name] = {'Community': community_name, 'Members': post.subreddit.subscribers, 'Found Via': set()}
@@ -48,11 +66,13 @@ def find_communities_hybrid(_reddit_instance, search_queries: tuple, direct_limi
                     try:
                         post.comments.replace_more(limit=0)
                         for comment in post.comments.list()[:comment_limit]:
+                            if st.session_state.get('cancel_scan'): break
                             if hasattr(comment, 'body') and query.lower() in comment.body.lower():
                                 aggregated_results[community_name]['Found Via'].add('Relevant Comment'); break
                     except Exception: continue
         except PRAWException: pass
     
+    if progress_bar: progress_bar.progress(1.0, text="Finalizing results...")
     if not aggregated_results: return pd.DataFrame()
 
     final_list = [{'Community': f"r/{name}", **data} for name, data in aggregated_results.items()]
@@ -68,9 +88,9 @@ def find_communities_hybrid(_reddit_instance, search_queries: tuple, direct_limi
     column_order = ['Community', 'Relevance Score', 'Found Via', 'Members', 'Community Link', 'Top Posts (Month)']
     return df[column_order].reset_index(drop=True)
 
+
 # --- De 'find_buying_signals' functie blijft onveranderd ---
 def find_buying_signals(_reddit, subreddit_name: str, keywords: list, time_filter: str, post_limit: int, comment_limit: int):
-    # ... (Deze functie blijft exact hetzelfde) ...
     signals = []
     subreddit = _reddit.subreddit(subreddit_name)
     top_posts = subreddit.top(time_filter=time_filter, limit=post_limit)
@@ -90,7 +110,6 @@ def find_buying_signals(_reddit, subreddit_name: str, keywords: list, time_filte
 
 # --- UI Functies (Login) blijven onveranderd ---
 def show_password_form():
-    # ... (deze functie blijft hetzelfde) ...
     st.title("🚀 The Opportunity Finder")
     st.header("Step 1: App Access Login")
     with st.form(key='password_login_form'):
@@ -100,7 +119,6 @@ def show_password_form():
             else: st.error("🚨 The password you entered is incorrect.")
 
 def show_reddit_login_page():
-    # ... (deze functie blijft hetzelfde) ...
     st.title("🚀 The Opportunity Finder")
     st.header("Step 2: Connect your Reddit Account")
     st.markdown("Access confirmed. Please log in with Reddit to allow the app to perform searches on your behalf.")
@@ -109,57 +127,87 @@ def show_reddit_login_page():
     st.link_button("Login with Reddit", auth_url, type="primary", use_container_width=True)
     st.info("ℹ️ You will be redirected to Reddit to grant permission. This app never sees your password.")
 
-# --- Hoofdapplicatie (Met de upgrade geïntegreerd) ---
+# --- Hoofdapplicatie (AANGEPAST) ---
 def show_main_app(reddit):
+    # State variabelen voor beide taken
+    if 'community_scan_running' not in st.session_state: st.session_state.community_scan_running = False
+    if 'cancel_scan' not in st.session_state: st.session_state.cancel_scan = False
+    if 'scan_was_cancelled' not in st.session_state: st.session_state.scan_was_cancelled = False
     if 'signal_scan_running' not in st.session_state: st.session_state.signal_scan_running = False
     
+    is_any_scan_running = st.session_state.community_scan_running or st.session_state.signal_scan_running
+
     col1, col2 = st.columns([0.85, 0.15])
     with col1:
         st.title("🚀 The Opportunity Finder")
         st.markdown(f"Logged in as **u/{st.session_state.username}**.")
     with col2:
-        if st.button("Logout", use_container_width=True, disabled=st.session_state.signal_scan_running):
+        if st.button("Logout", use_container_width=True, disabled=is_any_scan_running):
             st.session_state.clear(); st.rerun()
 
-    # --- Deel 1: Communities Vinden (MET UI HARMONISATIE) ---
-    st.header("1. Discover Relevant Communities")
+    # --- Deel 1: Communities Vinden (GESYNCHRONISEERD MET AUDIENCE FINDER) ---
+    st.header("1. Discover Communities")
     
     with st.expander("⚙️ Advanced Search Settings"):
         st.markdown("Control the trade-off between search speed and thoroughness.")
         c1, c2, c3 = st.columns(3)
-        direct_limit = c1.slider("Direct Search Depth", 5, 50, 10, help="How many communities to find based on name/description. Quick but less precise.")
-        post_limit = c2.slider("Post Search Depth", 10, 100, 25, help="How many posts to analyze. Finds communities where your topic is actively discussed.")
-        comment_limit = c3.slider("Comment Search Depth", 0, 50, 20, help="How many comments *per post* to analyze. Deepest (and slowest) search for finding hidden user pain points.")
+        direct_limit = c1.slider("Direct Search Depth", 0, 50, 10, help="How many communities to find based on name/description. Quick but less precise.", disabled=st.session_state.community_scan_running)
+        post_limit = c2.slider("Post Search Depth", 0, 50, 25, help="How many posts to analyze. Finds communities where your topic is actively discussed.", disabled=st.session_state.community_scan_running)
+        comment_limit = c3.slider("Comment Search Depth", 0, 50, 20, help="How many comments *per post* to analyze. Deepest (and slowest) search for finding hidden user pain points.", disabled=st.session_state.community_scan_running)
 
     with st.form(key='community_search_form'):
-        search_queries_input = st.text_area("Enter search queries (one per line)", placeholder="e.g., SaaS for startups\nmachine learning projects", height=120, label_visibility="collapsed")
-        community_form_submitted = st.form_submit_button("Find Communities", type="primary", use_container_width=True)
+        search_queries_input = st.text_area("Keywords (one per line)", placeholder="For example:\nSaaS for startups...", height=120, label_visibility="collapsed", disabled=st.session_state.community_scan_running)
+        community_form_submitted = st.form_submit_button("Find Communities", type="primary", use_container_width=True, disabled=st.session_state.community_scan_running)
 
-    if community_form_submitted:
-        queries_tuple = tuple(sorted([q.strip() for q in search_queries_input.split('\n') if q.strip()]))
-        if not queries_tuple:
-            st.warning("Please enter at least one search query.")
-        else:
-            # NIEUW: De spinner die de bug oplost
-            with st.spinner("Discovering communities... This may take a moment depending on your settings."):
-                st.session_state['audience_df'] = find_communities_hybrid(reddit, queries_tuple, direct_limit, post_limit, comment_limit)
-            
-    st.subheader("Discovered Communities")
-    if "audience_df" in st.session_state and st.session_state.audience_df is not None:
-        if not st.session_state.audience_df.empty:
-            st.dataframe(st.session_state["audience_df"], use_container_width=True, hide_index=True)
-            csv_data = st.session_state["audience_df"].to_csv(index=False).encode('utf-8')
+        if community_form_submitted:
+            queries_tuple = tuple(sorted([q.strip() for q in search_queries_input.split('\n') if q.strip()]))
+            if not queries_tuple:
+                st.warning("Please enter at least one search query.")
+            else:
+                st.session_state.community_scan_running = True
+                st.session_state.cancel_scan = False
+                st.session_state.scan_was_cancelled = False
+                st.session_state.search_params = {"queries": queries_tuple, "direct": direct_limit, "post": post_limit, "comment": comment_limit}
+                st.rerun()
+
+    if st.session_state.community_scan_running:
+        st.info("Community search in progress...")
+        if st.button("Cancel Search", use_container_width=True):
+            st.session_state.cancel_scan = True
+            st.session_state.scan_was_cancelled = True
+        
+        st.session_state['progress_bar_placeholder'] = st.progress(0.0)
+        
+        try:
+            p = st.session_state.search_params
+            st.session_state['audience_df'] = find_communities_hybrid(reddit, p['queries'], p['direct'], p['post'], p['comment'])
+        finally:
+            st.session_state.community_scan_running = False
+            st.session_state.cancel_scan = False
+            if 'search_params' in st.session_state: del st.session_state.search_params
+            if 'progress_bar_placeholder' in st.session_state: del st.session_state['progress_bar_placeholder']
+            st.rerun()
+
+    # Resultaatweergave
+    if st.session_state.get("scan_was_cancelled"):
+        st.warning("️️Search was cancelled by the user.")
+        st.session_state.scan_was_cancelled = False
+        if 'audience_df' in st.session_state: del st.session_state['audience_df']
+    
+    elif "audience_df" in st.session_state:
+        st.header("Search Results")
+        results_df = st.session_state['audience_df']
+        if results_df is not None and not results_df.empty:
+            st.dataframe(results_df, use_container_width=True, hide_index=True)
+            csv_data = results_df.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download Communities as CSV", csv_data, 'community_discovery_results.csv', 'text/csv', use_container_width=True)
         else:
             st.success("✅ Search complete. No communities found for these terms.")
-    else:
-        st.info("Enter queries above and click 'Find Communities' to start your discovery.")
 
     st.divider()
 
     # --- Deel 2: Opportunity Finder (ONVERANDERD) ---
     st.header("2. Scan for Buying Signals")
-    # ... (De rest van de app blijft volledig ongewijzigd) ...
     st.markdown("Deep-dive into specific communities to find posts and comments indicating a need or problem.")
     with st.form(key="signal_scanner_form", border=True):
         preset = st.radio("Scan Intensity", ["🟢 Fast", "🔵 Standard", "🔴 Deep", "⚙️ Custom"], index=1, horizontal=True, disabled=st.session_state.signal_scan_running)
@@ -172,6 +220,7 @@ def show_main_app(reddit):
         subreddits_input = st.text_area("Subreddits to scan (one per line)", placeholder="e.g. r/sidehustle\nr/solopreneur", height=150, disabled=st.session_state.signal_scan_running)
         keywords_input = st.text_area("Pain point keywords (one per line)", placeholder="e.g. market research\nfind clients", height=150, disabled=st.session_state.signal_scan_running)
         signal_form_submitted = st.form_submit_button("🔎 Run Buying Signal Scan", type="primary", use_container_width=True, disabled=st.session_state.signal_scan_running)
+    
     if signal_form_submitted and not st.session_state.signal_scan_running:
         st.session_state.signal_scan_running = True
         if preset.startswith("🟢"): st.session_state.limits = (10, 20)
@@ -182,6 +231,7 @@ def show_main_app(reddit):
         st.session_state.subreddits = [s.strip() for s in subreddits_input.split('\n') if s.strip()]
         st.session_state.keywords = [k.strip() for k in keywords_input.split('\n') if k.strip()]
         st.rerun()
+
     if st.session_state.signal_scan_running:
         st.info("Buying signal scan in progress...")
         all_signals, progress_bar = [], st.progress(0.0, text="Starting scan...")
@@ -201,6 +251,7 @@ def show_main_app(reddit):
                 else: st.session_state["signals_df"] = None
         finally:
             st.session_state.signal_scan_running = False; st.rerun()
+            
     if "signals_df" in st.session_state and st.session_state.signals_df is not None:
         df_signals = st.session_state["signals_df"]
         st.success(f"✅ Found {len(df_signals)} buying signals.")
@@ -208,9 +259,8 @@ def show_main_app(reddit):
         csv_signals = df_signals.to_csv(index=False).encode('utf-8')
         st.download_button("📥 Download Signals as CSV", csv_signals, 'opportunity_finder_signals.csv', 'text/csv', use_container_width=True)
 
-# --- Hoofdlogica (Login State Machine) ---
+# --- Hoofdlogica (Login State Machine) - ONVERANDERD ---
 def main():
-    # ... (deze functie blijft ook hetzelfde) ...
     st.set_page_config(page_title="The Opportunity Finder", layout="wide")
     auth_code = st.query_params.get("code")
     if "refresh_token" in st.session_state:
