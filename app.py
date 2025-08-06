@@ -88,7 +88,7 @@ def find_buying_signals(_reddit, subreddit_name: str, keywords: list, time_filte
                 if hasattr(comment, 'body') and comment.author:
                     for keyword in keywords:
                         if keyword.lower() in comment.body.lower():
-                            signals.append({"Subreddit": subreddit_name, "Match": keyword, "Type": "Comment", "Text": comment.body.replace('\n', ' ').strip()[:300] + '...', "Author": comment.author.name, "Link": f"https://reddit.com{comment.permalink}"}); break
+                            signals.append({"Subreddit": subreddit_name, "Match": keyword, "Type": "Comment", "Text": comment.body.replace('\n', ' '), "Author": comment.author.name, "Link": f"https://reddit.com{comment.permalink}"}); break
     return signals
 
 # --- UI Functies (Login) ---
