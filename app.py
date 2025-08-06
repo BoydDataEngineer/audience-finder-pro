@@ -6,6 +6,7 @@ import numpy as np
 import praw
 from praw.exceptions import PRAWException
 from prawcore.exceptions import NotFound, Forbidden, BadRequest
+import re
 
 # --- Configuratie & Secrets ---
 CLIENT_ID = st.secrets.get("reddit_client_id")
@@ -71,24 +72,82 @@ def find_communities_hybrid(_reddit, search_queries: tuple, direct_limit: int, p
     return df[['Community', 'Relevance Score', 'Found Via', 'Members', 'Community Link', 'Top Posts (Month)']].reset_index(drop=True)
 
 def find_buying_signals(_reddit, subreddit_name: str, keywords: list, time_filter: str, post_limit: int, comment_limit: int):
-    """Vindt buying signals en ondersteunt een cancel-operatie."""
+    """
+    Vindt buying signals op een robuuste manier, filtert verwijderde content,
+    en ondersteunt een cancel-operatie.
+    """
     signals = []
     subreddit = _reddit.subreddit(subreddit_name)
-    top_posts = subreddit.top(time_filter=time_filter, limit=post_limit)
+    
+    try:
+        top_posts = subreddit.top(time_filter=time_filter, limit=post_limit)
+    except Exception as e:
+        st.warning(f"Could not fetch posts for r/{subreddit_name}: {e}")
+        return []
+
     for post in top_posts:
         if st.session_state.get('signal_cancel_scan'): break
-        post_content = f"{post.title.lower()} {post.selftext.lower()}"
-        matched_post_keywords = {keyword for keyword in keywords if keyword.lower() in post_content}
-        if matched_post_keywords and post.author:
-            signals.append({"Subreddit": subreddit_name, "Match": ', '.join(matched_post_keywords), "Type": "Post", "Text": post.title.replace('\n', ' ').strip(), "Author": post.author.name, "Link": f"https://reddit.com{post.permalink}"})
+
+        try:
+            # --- Post verwerking ---
+            if post.author and post.author.name != '[deleted]':
+                post_title = re.sub(r'\s+', ' ', post.title).strip()
+                post_selftext = re.sub(r'\s+', ' ', post.selftext).strip()
+                post_content = f"{post_title.lower()} {post_selftext.lower()}"
+                
+                matched_post_keywords = {keyword for keyword in keywords if keyword.lower() in post_content}
+                if matched_post_keywords:
+                    signals.append({
+                        "Subreddit": subreddit_name, 
+                        "Match": ', '.join(matched_post_keywords), 
+                        "Type": "Post", 
+                        "Text": post_title, 
+                        "Author": post.author.name, 
+                        "Link": f"https://reddit.com{post.permalink}"
+                    })
+        except Exception as e:
+            st.warning(f"Skipped a post in r/{subreddit_name} due to an error: {e}")
+            continue
+
+        # --- Comment verwerking ---
         if comment_limit > 0:
-            post.comments.replace_more(limit=0)
-            for comment in post.comments.list()[:comment_limit]:
-                if st.session_state.get('signal_cancel_scan'): break
-                if hasattr(comment, 'body') and comment.author:
-                    for keyword in keywords:
-                        if keyword.lower() in comment.body.lower():
-                            signals.append({"Subreddit": subreddit_name, "Match": keyword, "Type": "Comment", "Text": comment.body.replace('\n', ' '), "Author": comment.author.name, "Link": f"https://reddit.com{comment.permalink}"}); break
+            try:
+                post.comments.replace_more(limit=0)
+                for comment in post.comments.list()[:comment_limit]:
+                    if st.session_state.get('signal_cancel_scan'): break
+                    
+                    try:
+                        # 1. STRIKTE CONTROLE: Zorg dat de comment en auteur bestaan en niet verwijderd zijn.
+                        if not (hasattr(comment, 'body') and hasattr(comment, 'author') and comment.author and hasattr(comment, 'permalink')):
+                            continue
+                        if comment.body in ['[deleted]', '[removed]'] or comment.author.name == '[deleted]':
+                            continue
+
+                        # 2. TEKSTOPSCHONING: Verwijder overtollige witruimte voor een schone output.
+                        comment_text = re.sub(r'\s+', ' ', comment.body).strip()
+                        if not comment_text: # Sla over als de comment na opschonen leeg is.
+                            continue
+                        
+                        # Zoek naar keywords in de opgeschoonde tekst
+                        for keyword in keywords:
+                            if keyword.lower() in comment_text.lower():
+                                signals.append({
+                                    "Subreddit": subreddit_name, 
+                                    "Match": keyword, 
+                                    "Type": "Comment", 
+                                    "Text": comment_text, # Gebruik de opgeschoonde tekst
+                                    "Author": comment.author.name, 
+                                    "Link": f"https://reddit.com{comment.permalink}"
+                                })
+                                break # Ga naar de volgende comment zodra een match is gevonden
+                    
+                    except Exception as e:
+                        # 3. VANGNET: Sla deze specifieke comment over als er toch een onverwachte fout is.
+                        st.warning(f"Skipped one comment in r/{subreddit_name} due to data issue: {e}")
+                        continue
+            except Exception as e:
+                 st.warning(f"Could not load comments for a post in r/{subreddit_name}: {e}")
+
     return signals
 
 # --- UI Functies (Login) ---
